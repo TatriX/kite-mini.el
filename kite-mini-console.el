@@ -1,7 +1,7 @@
 (require 'cl)
 (require 'comint)
 (require 'kite-mini)
-
+(require 'json)
 (require 'js) ; for syntax highlighting
 
 (defface kite-mini-log-warning
@@ -102,7 +102,7 @@
 
 (defun kite-mini-console-eval-input (input)
   (kite-mini-send-eval
-   input
+   (format "console.log(%s)" input)
    (lambda (result)
      (if (eq :json-false (plist-get result :wasThrown))
          (comint-output-filter
@@ -233,6 +233,31 @@ side."
     (error "kite--release-object called with null OBJECT-ID"))
   (kite-mini-call-rpc "Runtime.releaseObject"
                       `((objectId . ,object-id))))
+
+(defun kite-mini--console-format (parameters)
+  (cl-labels ((fmt-array (array)
+                         (if (listp array)
+                             (--map (fmt it) array)
+                           array))
+              (fmt-hash (hash)
+                        (--map (cons (plist-get it :name) (fmt it)) hash))
+              (fmt-object (object)
+                          (let ((preview (plist-get object :preview)))
+                            (if preview
+                                (pcase (plist-get preview  :subtype)
+                                  ("array" (fmt-array (plist-get  preview :properties) ))
+                                  (_ (fmt-hash (plist-get preview :properties))))
+                              (format "<%s>" (or (plist-get object :description)
+                                                 (plist-get object :value))))))
+              (fmt (object)
+                   (pcase (plist-get object :type)
+                     ("number" (string-to-number (or (plist-get object :description)
+                                                     (plist-get object :value))))
+                     ("string" (plist-get object :value))
+                     ("object" (fmt-object object))
+                     ("undefined" "<undefined>")
+                     (_ object))))
+    (json-encode (-mapcat #'fmt parameters))))
 
 (defun kite-mini-console ()
   "Start a kite mini console."

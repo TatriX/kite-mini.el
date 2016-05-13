@@ -41,7 +41,14 @@
 (require 'json)
 (require 'dash)
 (require 'websocket)
+(require 'sourcemap)
 
+
+(defun kite-mini--get-url-content (url)
+  (with-current-buffer (url-retrieve-synchronously url)
+    (prog1
+        (buffer-string)
+      (kill-buffer))))
 
 (defcustom kite-mini-remote-host "127.0.0.1"
   "Default host for connection to WebKit remote debugging API."
@@ -59,6 +66,22 @@
 (defvar kite-mini-rpc-scripts nil
   "List of JavaScript files available for live editing.")
 
+(defvar kite-mini-project-root ""
+  "Path to the project root. Used for sourcemap search.")
+
+(defvar kite-mini-sourcemaps ()
+  "List of sourcemap to track")
+
+(defun kite-mini--project-path (path)
+  (when (string-empty-p kite-mini-project-root)
+    (warn "kite-mini-project-root is empty; use M-x kite-mini-set-project-root"))
+  (concat kite-mini-project-root path))
+
+(defun kite-mini-set-project-root (dir)
+  "Set `kite-mini-project-root' for sourcemap search"
+  ;; TODO: use user's default completion method
+  (interactive (list (read-directory-name "Project root:" default-directory default-directory)))
+  (setq kite-mini-project-root dir))
 
 (defun kite-mini-encode (data)
   (let ((json-array-type 'list)
@@ -94,9 +117,31 @@
 (defun kite-mini-on-script-parsed (data)
   (let ((extension? (plist-get data :isContentScript))
         (url (plist-get data :url))
+        (source-map-url (plist-get data :sourceMapURL))
         (id (plist-get data :scriptId)))
     (when (and (eq extension? :json-false) (not (string-equal "" url)))
-      (add-to-list 'kite-mini-rpc-scripts (list :id id :url url)))))
+      (setq kite-mini-rpc-scripts
+            (--remove (equal (plist-get it :url) url)
+                      kite-mini-rpc-scripts))
+      (add-to-list 'kite-mini-rpc-scripts
+                   (list :id id
+                         :url url
+                         :source-map (kite-mini--lazy-load-source-map source-map-url))))))
+;; (concat (url-basepath url) source-map-url)
+
+(defun kite-mini--lazy-load-source-map (url)
+  ;; TODO: download url (currently very slow)
+  ;; (sourcemap-from-string (kite-mini--get-url-content url))
+  (let ((path (kite-mini--project-path url)))
+    (when (file-regular-p path)
+      (cons 'lazy-source-map path))))
+
+(defun kite-mini--get-source-map (script)
+  (let ((source-map (plist-get script :source-map)))
+    (when (and (consp source-map) (eq (car source-map) 'lazy-source-map))
+      (setq source-map (sourcemap-from-file (cdr source-map)))
+      (plist-put script :source-map source-map))
+    source-map))
 
 (defun kite-mini-on-script-failed-to-parse (data)
   (kite-mini-console-append (format "%s" data)))
@@ -108,11 +153,25 @@
          (line (plist-get message :line))
          (type (plist-get message :type))
          (level (plist-get message :level))
-         (text (plist-get message :text)))
-    ;; TODO: add colors based on level
+         (parameters (plist-get message :parameters))
+         (stack (plist-get message :stack)))
+    (when stack
+      (let* ((frame (first (plist-get stack :callFrames)))
+             (script (kite-mini-find-script (plist-get frame :scriptId)))
+             (source-map (kite-mini--get-source-map script)))
+        (when source-map
+          (let ((info (sourcemap-original-position-for
+                       source-map
+                       :line (plist-get frame :lineNumber)
+                       :column (- (plist-get frame :columnNumber) 1))))
+            (setq url  (plist-get info :source)
+                  line (plist-get info :line)
+                  column (plist-get info :column))))))
     (kite-mini-console-append (propertize
                                (format "%s: %s\t%s (line: %s column: %s)"
-                                       level text url line column)
+                                       level
+                                       (kite-mini--console-format parameters)
+                                       url line column)
                                'font-lock-face (intern (format "kite-mini-log-%s" level))))))
 
 (defun kite-mini-on-message (socket data)
@@ -133,6 +192,8 @@
                                         (plist-get data :result)))))))
 
 (defun kite-mini-call-rpc (method &optional params callback)
+  (unless (kite-mini--connected-p)
+    (kite-mini-connect))
   (let ((id (kite-mini-next-rpc-id)))
     (when callback
       (kite-mini-register-callback id callback))
@@ -192,9 +253,12 @@
     (kite-mini-call-rpc "Debugger.enable")
     (kite-mini-call-rpc "Network.setCacheDisabled" '(:cacheDisabled t))))
 
+(defun kite-mini--connected-p ()
+  (websocket-openp kite-mini-socket))
+
 (defun kite-mini-disconnect ()
   (interactive)
-  (when (websocket-openp kite-mini-socket)
+  (when (kite-mini--connected-p)
     (websocket-close kite-mini-socket)
     (setq kite-mini-socket nil
           kite-mini-rpc-scripts nil)))
@@ -217,8 +281,24 @@
                          kite-mini-rpc-scripts)))
     (when script (plist-get script :id))))
 
+(defun kite-mini-find-script (id)
+  (--find (equal (plist-get it :id) id) kite-mini-rpc-scripts))
+
+(defun kite-mini--get-string-from-file (filePath)
+  "Return filePath's file content."
+  (with-temp-buffer
+    (insert-file-contents filePath)
+    (buffer-string)))
+
+;;
+
 (defun kite-mini-update ()
   (interactive)
+  (if (functionp 'kite-mini-update-custom)
+      (kite-mini-update-custom)
+    (kite-mini--update)))
+
+(defun kite-mini--update ()
   (let ((id (kite-mini-script-id (buffer-file-name)))
         (source (buffer-substring-no-properties
                  (point-min) (point-max))))
@@ -227,6 +307,15 @@
          "Debugger.setScriptSource"
          (list :scriptId id :scriptSource source))
       (message "No matching script for current buffer."))))
+
+(defun kite-mini--find-script-by-path (path line column)
+  (cl-loop for script in kite-mini-rpc-scripts
+           for source-map = (kite-mini--get-source-map script)
+           when (sourcemap-generated-position-for source-map
+                                                  :source path
+                                                  :line line
+                                                  :column column)
+           return script))
 
 (defun kite-mini-reload ()
   (interactive)
@@ -248,8 +337,9 @@
 (defvar kite-mini-mode-map
   (let ((map (make-sparse-keymap)))
     (prog1 map
-      (define-key map (kbd "C-c C-c") #'kite-mini-evaluate-region-or-line)
+      (define-key map (kbd "C-x C-e") #'kite-mini-evaluate-region-or-line)
       (define-key map (kbd "C-c C-k") #'kite-mini-update)
+      (define-key map (kbd "C-c C-z") #'kite-mini-console)
       (define-key map (kbd "C-c C-r") #'kite-mini-reload)))
   "Keymap for Kite Mini mode.")
 
